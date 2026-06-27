@@ -2,7 +2,7 @@ import { Client, GatewayIntentBits } from "discord.js";
 import { logger } from "./logger";
 
 const LONDON_TIMEZONE = "Europe/London";
-const UPDATE_INTERVAL_MS = 5 * 60 * 1000;
+const UPDATE_INTERVAL_MS = 60 * 1000;
 
 function getLondonTime(): string {
   const now = new Date();
