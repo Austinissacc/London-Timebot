@@ -13,6 +13,7 @@ import { logger } from "./logger";
 import { db } from "@workspace/db";
 import { remindersTable } from "@workspace/db";
 import { lt, eq, and } from "drizzle-orm";
+import { adminCommand, handleAdminCommand } from "./discord-admin";
 
 const LONDON_TIMEZONE = "Europe/London";
 // Discord rate-limits channel renames to 2 per 10 minutes per channel.
@@ -357,6 +358,7 @@ async function registerSlashCommands(token: string, clientId: string): Promise<v
       timeCommand.toJSON(),
       worldclockCommand.toJSON(),
       remindCommand.toJSON(),
+      adminCommand.toJSON(),
     ],
   });
   logger.info("Slash commands registered globally");
@@ -895,6 +897,13 @@ export async function startDiscordBot(): Promise<void> {
     if (interaction.commandName === "worldclock") {
       await handleWorldclockCommand(interaction).catch((err) =>
         logger.error({ err }, "Failed to handle /worldclock"),
+      );
+      return;
+    }
+
+    if (interaction.commandName === "admin") {
+      await handleAdminCommand(interaction).catch((err) =>
+        logger.error({ err }, "Failed to handle /admin"),
       );
       return;
     }
