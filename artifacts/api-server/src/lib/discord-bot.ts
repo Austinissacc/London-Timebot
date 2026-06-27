@@ -19,6 +19,8 @@ const LONDON_TIMEZONE = "Europe/London";
 // We update every 10 minutes to stay safely within that limit.
 const UPDATE_INTERVAL_MS = 10 * 60 * 1000;
 const REMINDER_CHECK_INTERVAL_MS = 30 * 1000;
+const LIVE_CLOCK_INTERVAL_MS = 60 * 1000;
+const LIVE_CLOCK_TAG = "<!-- london-live-clock -->";
 
 // ── Time helpers ────────────────────────────────────────────────
 
@@ -431,6 +433,71 @@ async function fireReminders(client: Client, reminderChannelId: string): Promise
   }
 }
 
+// ── Live clock pinned message ───────────────────────────────────
+
+function buildClockMessage(): string {
+  const time = getLondonTime();
+  const date = getLondonDate();
+  return (
+    `${LIVE_CLOCK_TAG}\n` +
+    `🕐 **London Live Clock**\n` +
+    `**Time:** \`${time}\`\n` +
+    `**Date:** ${date}\n` +
+    `_Updates every minute_`
+  );
+}
+
+async function setupLiveClock(client: Client, reminderChannelId: string): Promise<void> {
+  try {
+    const channel = await client.channels.fetch(reminderChannelId);
+    if (!(channel instanceof TextChannel)) {
+      logger.warn({ reminderChannelId }, "Reminder channel is not a text channel — skipping live clock");
+      return;
+    }
+
+    // Try to find an existing pinned clock message from a previous run
+    let clockMessage: Message | null = null;
+    const pinned = await channel.messages.fetchPinned();
+    for (const msg of pinned.values()) {
+      if (msg.author.id === client.user?.id && msg.content.includes(LIVE_CLOCK_TAG)) {
+        clockMessage = msg;
+        break;
+      }
+    }
+
+    // If no pinned clock message found, create one (and try to pin it)
+    if (!clockMessage) {
+      clockMessage = await channel.send(buildClockMessage());
+      try {
+        await clockMessage.pin();
+        logger.info({ messageId: clockMessage.id }, "Live clock message created and pinned");
+      } catch {
+        logger.warn(
+          { messageId: clockMessage.id },
+          "Live clock message created (could not pin — grant bot Manage Messages permission to pin it)",
+        );
+      }
+    } else {
+      logger.info({ messageId: clockMessage.id }, "Resuming existing live clock message");
+    }
+
+    // Edit the message right away then every minute
+    const edit = async (): Promise<void> => {
+      try {
+        await clockMessage!.edit(buildClockMessage());
+        logger.info("Live clock updated");
+      } catch (err) {
+        logger.error({ err }, "Failed to edit live clock message");
+      }
+    };
+
+    await edit();
+    setInterval(edit, LIVE_CLOCK_INTERVAL_MS);
+  } catch (err) {
+    logger.error({ err }, "Failed to set up live clock");
+  }
+}
+
 // ── Main bot entry ──────────────────────────────────────────────
 
 export async function startDiscordBot(): Promise<void> {
@@ -490,6 +557,7 @@ export async function startDiscordBot(): Promise<void> {
     if (reminderChannelId) {
       await fireReminders(client, reminderChannelId);
       setInterval(() => fireReminders(client, reminderChannelId), REMINDER_CHECK_INTERVAL_MS);
+      await setupLiveClock(client, reminderChannelId);
     }
   });
 
