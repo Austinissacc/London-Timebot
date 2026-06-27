@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "eZq7CXd3tUhpB1o-rryj5"
+uri = "file://discord-bot-code.tar.gz"
+type = "unspecified"
+title = "Discord Bot Source Code"
