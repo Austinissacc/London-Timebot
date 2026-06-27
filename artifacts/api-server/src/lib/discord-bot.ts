@@ -22,6 +22,95 @@ const REMINDER_CHECK_INTERVAL_MS = 30 * 1000;
 const LIVE_CLOCK_INTERVAL_MS = 60 * 1000;
 const LIVE_CLOCK_TAG = "<!-- london-live-clock -->";
 
+// ── Timezone lookup ─────────────────────────────────────────────
+
+const TIMEZONE_ALIASES: Record<string, string> = {
+  london: "Europe/London",
+  uk: "Europe/London",
+  "new york": "America/New_York",
+  "new_york": "America/New_York",
+  newyork: "America/New_York",
+  nyc: "America/New_York",
+  "los angeles": "America/Los_Angeles",
+  la: "America/Los_Angeles",
+  "los_angeles": "America/Los_Angeles",
+  chicago: "America/Chicago",
+  toronto: "America/Toronto",
+  saopaulo: "America/Sao_Paulo",
+  "sao paulo": "America/Sao_Paulo",
+  "sao_paulo": "America/Sao_Paulo",
+  paris: "Europe/Paris",
+  berlin: "Europe/Berlin",
+  amsterdam: "Europe/Amsterdam",
+  madrid: "Europe/Madrid",
+  rome: "Europe/Rome",
+  moscow: "Europe/Moscow",
+  dubai: "Asia/Dubai",
+  uae: "Asia/Dubai",
+  mumbai: "Asia/Kolkata",
+  india: "Asia/Kolkata",
+  kolkata: "Asia/Kolkata",
+  delhi: "Asia/Kolkata",
+  bangkok: "Asia/Bangkok",
+  singapore: "Asia/Singapore",
+  hongkong: "Asia/Hong_Kong",
+  "hong kong": "Asia/Hong_Kong",
+  "hong_kong": "Asia/Hong_Kong",
+  shanghai: "Asia/Shanghai",
+  beijing: "Asia/Shanghai",
+  china: "Asia/Shanghai",
+  tokyo: "Asia/Tokyo",
+  japan: "Asia/Tokyo",
+  seoul: "Asia/Seoul",
+  sydney: "Australia/Sydney",
+  melbourne: "Australia/Melbourne",
+  auckland: "Pacific/Auckland",
+  hawaii: "Pacific/Honolulu",
+  utc: "UTC",
+};
+
+const WORLDCLOCK_ZONES: Array<{ label: string; tz: string; flag: string }> = [
+  { label: "London", tz: "Europe/London", flag: "🇬🇧" },
+  { label: "New York", tz: "America/New_York", flag: "🇺🇸" },
+  { label: "Los Angeles", tz: "America/Los_Angeles", flag: "🇺🇸" },
+  { label: "Dubai", tz: "Asia/Dubai", flag: "🇦🇪" },
+  { label: "Mumbai", tz: "Asia/Kolkata", flag: "🇮🇳" },
+  { label: "Singapore", tz: "Asia/Singapore", flag: "🇸🇬" },
+  { label: "Tokyo", tz: "Asia/Tokyo", flag: "🇯🇵" },
+  { label: "Sydney", tz: "Australia/Sydney", flag: "🇦🇺" },
+];
+
+function resolveTimezone(input: string): string | null {
+  const key = input.trim().toLowerCase();
+  if (TIMEZONE_ALIASES[key]) return TIMEZONE_ALIASES[key]!;
+  // Try it as a raw IANA timezone string
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: input });
+    return input;
+  } catch {
+    return null;
+  }
+}
+
+function getTimeInZone(tz: string): { time: string; date: string } {
+  const now = new Date();
+  const time = now.toLocaleTimeString("en-GB", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const date = now.toLocaleDateString("en-GB", {
+    timeZone: tz,
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+  return { time, date };
+}
+
 // ── Time helpers ────────────────────────────────────────────────
 
 function getLondonTime(): string {
@@ -161,6 +250,20 @@ const statusCommand = new SlashCommandBuilder()
   .setName("status")
   .setDescription("Get the current London time");
 
+const timeCommand = new SlashCommandBuilder()
+  .setName("time")
+  .setDescription("Get the current time in any city or timezone")
+  .addStringOption((opt) =>
+    opt
+      .setName("zone")
+      .setDescription('City or timezone, e.g. "Tokyo", "Dubai", "America/Chicago"')
+      .setRequired(true),
+  );
+
+const worldclockCommand = new SlashCommandBuilder()
+  .setName("worldclock")
+  .setDescription("Show current time across major world cities");
+
 const remindCommand = new SlashCommandBuilder()
   .setName("remind")
   .setDescription("Manage event reminders")
@@ -199,7 +302,12 @@ const remindCommand = new SlashCommandBuilder()
 async function registerSlashCommands(token: string, clientId: string): Promise<void> {
   const rest = new REST().setToken(token);
   await rest.put(Routes.applicationCommands(clientId), {
-    body: [statusCommand.toJSON(), remindCommand.toJSON()],
+    body: [
+      statusCommand.toJSON(),
+      timeCommand.toJSON(),
+      worldclockCommand.toJSON(),
+      remindCommand.toJSON(),
+    ],
   });
   logger.info("Slash commands registered globally");
 }
@@ -209,6 +317,34 @@ async function registerSlashCommands(token: string, clientId: string): Promise<v
 async function handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.reply({
     content: `🕐 **London Time**\n**Time:** ${getLondonTime()}\n**Date:** ${getLondonDate()}`,
+  });
+}
+
+async function handleTimeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const input = interaction.options.getString("zone", true);
+  const tz = resolveTimezone(input);
+  if (!tz) {
+    await interaction.reply({
+      content:
+        `❌ Unknown city or timezone: \`${input}\`\n` +
+        `Try a city name like \`Tokyo\`, \`Dubai\`, \`New York\` or an IANA zone like \`America/Chicago\`.`,
+      ephemeral: true,
+    });
+    return;
+  }
+  const { time, date } = getTimeInZone(tz);
+  await interaction.reply({
+    content: `🌍 **Time in ${input}**\n**Time:** \`${time}\`\n**Date:** ${date}`,
+  });
+}
+
+async function handleWorldclockCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const lines = WORLDCLOCK_ZONES.map(({ label, tz, flag }) => {
+    const { time } = getTimeInZone(tz);
+    return `${flag} **${label}** — \`${time}\``;
+  });
+  await interaction.reply({
+    content: `🌐 **World Clock**\n\n${lines.join("\n")}`,
   });
 }
 
@@ -567,6 +703,20 @@ export async function startDiscordBot(): Promise<void> {
     if (interaction.commandName === "status") {
       await handleStatusCommand(interaction).catch((err) =>
         logger.error({ err }, "Failed to handle /status"),
+      );
+      return;
+    }
+
+    if (interaction.commandName === "time") {
+      await handleTimeCommand(interaction).catch((err) =>
+        logger.error({ err }, "Failed to handle /time"),
+      );
+      return;
+    }
+
+    if (interaction.commandName === "worldclock") {
+      await handleWorldclockCommand(interaction).catch((err) =>
+        logger.error({ err }, "Failed to handle /worldclock"),
       );
       return;
     }
