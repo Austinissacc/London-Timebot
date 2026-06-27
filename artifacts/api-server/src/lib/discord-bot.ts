@@ -727,11 +727,27 @@ async function fireReminders(client: Client, reminderChannelId: string): Promise
 
     for (const reminder of due) {
       try {
-        const channel = await client.channels.fetch(reminderChannelId);
-        if (channel instanceof TextChannel) {
-          await channel.send(
-            `🔔 **Reminder!** <@${reminder.userId}>\n📌 **${reminder.title}**\n🕐 Scheduled for ${formatRemindAt(reminder.remindAt)} (London time)`,
-          );
+        const message =
+          `🔔 **Reminder!**\n📌 **${reminder.title}**\n🕐 Scheduled for ${formatRemindAt(reminder.remindAt)} (London time)`;
+
+        // Try to DM the user first
+        let dmSent = false;
+        try {
+          const user = await client.users.fetch(reminder.userId);
+          const dm = await user.createDM();
+          await dm.send(message);
+          dmSent = true;
+          logger.info({ reminderId: reminder.id, userId: reminder.userId }, "Reminder sent via DM");
+        } catch {
+          logger.warn({ reminderId: reminder.id, userId: reminder.userId }, "Could not DM user — falling back to reminder channel");
+        }
+
+        // Fall back to the reminder channel if DM failed
+        if (!dmSent) {
+          const channel = await client.channels.fetch(reminderChannelId);
+          if (channel instanceof TextChannel) {
+            await channel.send(`🔔 **Reminder!** <@${reminder.userId}>\n📌 **${reminder.title}**\n🕐 Scheduled for ${formatRemindAt(reminder.remindAt)} (London time)\n_I couldn't DM you — check your privacy settings to receive DMs._`);
+          }
         }
 
         await db
