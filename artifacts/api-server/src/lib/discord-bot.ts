@@ -6,15 +6,22 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   Interaction,
+  TextChannel,
+  Message,
 } from "discord.js";
 import { logger } from "./logger";
+import { db } from "@workspace/db";
+import { remindersTable } from "@workspace/db";
+import { lt, eq, and } from "drizzle-orm";
 
 const LONDON_TIMEZONE = "Europe/London";
 const UPDATE_INTERVAL_MS = 60 * 1000;
+const REMINDER_CHECK_INTERVAL_MS = 30 * 1000;
+
+// ── Time helpers ────────────────────────────────────────────────
 
 function getLondonTime(): string {
-  const now = new Date();
-  return now.toLocaleTimeString("en-GB", {
+  return new Date().toLocaleTimeString("en-GB", {
     timeZone: LONDON_TIMEZONE,
     hour: "2-digit",
     minute: "2-digit",
@@ -24,8 +31,7 @@ function getLondonTime(): string {
 }
 
 function getLondonDate(): string {
-  const now = new Date();
-  return now.toLocaleDateString("en-GB", {
+  return new Date().toLocaleDateString("en-GB", {
     timeZone: LONDON_TIMEZONE,
     weekday: "long",
     day: "numeric",
@@ -35,8 +41,7 @@ function getLondonDate(): string {
 }
 
 function getLondonTimeShort(): string {
-  const now = new Date();
-  return now.toLocaleTimeString("en-GB", {
+  return new Date().toLocaleTimeString("en-GB", {
     timeZone: LONDON_TIMEZONE,
     hour: "2-digit",
     minute: "2-digit",
@@ -45,8 +50,7 @@ function getLondonTimeShort(): string {
 }
 
 function getLondonDateShort(): string {
-  const now = new Date();
-  return now.toLocaleDateString("en-GB", {
+  return new Date().toLocaleDateString("en-GB", {
     timeZone: LONDON_TIMEZONE,
     weekday: "short",
     day: "numeric",
@@ -54,30 +58,383 @@ function getLondonDateShort(): string {
   });
 }
 
+/** Parse "YYYY-MM-DD HH:MM" → Date (treated as London time) */
+function parseLondonDatetime(dateStr: string, timeStr: string): Date | null {
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const timePattern = /^\d{2}:\d{2}$/;
+  if (!datePattern.test(dateStr) || !timePattern.test(timeStr)) return null;
+
+  const isoString = `${dateStr}T${timeStr}:00`;
+  // Convert the local London time to UTC by using Intl
+  const londonDate = new Date(
+    new Date(isoString).toLocaleString("en-US", { timeZone: LONDON_TIMEZONE }),
+  );
+  if (isNaN(londonDate.getTime())) return null;
+
+  // Proper approach: parse as London time
+  const utcDate = new Date(
+    new Date(`${dateStr}T${timeStr}:00`).getTime() -
+      getTimezoneOffsetMs(dateStr, timeStr),
+  );
+  return utcDate;
+}
+
+function getTimezoneOffsetMs(dateStr: string, timeStr: string): number {
+  const localDate = new Date(`${dateStr}T${timeStr}:00`);
+  const londonStr = localDate.toLocaleString("en-GB", { timeZone: LONDON_TIMEZONE });
+  // We use a simpler approach: Intl.DateTimeFormat offset trick
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone: LONDON_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  void londonStr;
+  void formatter;
+  return 0; // fallback — use direct ISO approach below
+}
+
+/** Better parser: treat input as London local time, convert to UTC */
+function parseLondonLocal(dateStr: string, timeStr: string): Date | null {
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const timePattern = /^\d{2}:\d{2}$/;
+  if (!datePattern.test(dateStr) || !timePattern.test(timeStr)) return null;
+
+  // Build the date in London timezone using Temporal-style trick
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: LONDON_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+
+  void parts;
+
+  // Simplest reliable approach: use the offset at that point in time
+  // Create a reference date in UTC, then adjust
+  const naiveUtc = new Date(`${dateStr}T${timeStr}:00Z`);
+  if (isNaN(naiveUtc.getTime())) return null;
+
+  // Find London offset at that naive time
+  const londonTimeStr = naiveUtc.toLocaleString("en-US", {
+    timeZone: LONDON_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const londonDate = new Date(londonTimeStr);
+  const offsetMs = naiveUtc.getTime() - londonDate.getTime();
+  return new Date(naiveUtc.getTime() + offsetMs);
+}
+
+function formatRemindAt(date: Date): string {
+  return date.toLocaleString("en-GB", {
+    timeZone: LONDON_TIMEZONE,
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+// ── Slash commands ──────────────────────────────────────────────
+
 const statusCommand = new SlashCommandBuilder()
   .setName("status")
   .setDescription("Get the current London time");
 
+const remindCommand = new SlashCommandBuilder()
+  .setName("remind")
+  .setDescription("Manage event reminders")
+  .addSubcommand((sub) =>
+    sub
+      .setName("add")
+      .setDescription("Add a new reminder (times are London time)")
+      .addStringOption((opt) =>
+        opt.setName("title").setDescription("What to remind you about").setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("date")
+          .setDescription("Date in YYYY-MM-DD format, e.g. 2026-07-01")
+          .setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("time")
+          .setDescription("Time in HH:MM format (London time), e.g. 14:30")
+          .setRequired(true),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub.setName("list").setDescription("List all upcoming reminders"),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("remove")
+      .setDescription("Remove a reminder by ID")
+      .addIntegerOption((opt) =>
+        opt.setName("id").setDescription("Reminder ID from /remind list").setRequired(true),
+      ),
+  );
+
 async function registerSlashCommands(token: string, clientId: string): Promise<void> {
   const rest = new REST().setToken(token);
   await rest.put(Routes.applicationCommands(clientId), {
-    body: [statusCommand.toJSON()],
+    body: [statusCommand.toJSON(), remindCommand.toJSON()],
   });
   logger.info("Slash commands registered globally");
 }
 
+// ── Slash command handlers ──────────────────────────────────────
+
 async function handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  const time = getLondonTime();
-  const date = getLondonDate();
   await interaction.reply({
-    content: `🕐 **London Time**\n**Time:** ${time}\n**Date:** ${date}`,
-    ephemeral: false,
+    content: `🕐 **London Time**\n**Time:** ${getLondonTime()}\n**Date:** ${getLondonDate()}`,
   });
 }
+
+async function handleRemindAdd(interaction: ChatInputCommandInteraction): Promise<void> {
+  const title = interaction.options.getString("title", true);
+  const dateStr = interaction.options.getString("date", true);
+  const timeStr = interaction.options.getString("time", true);
+
+  const remindAt = parseLondonLocal(dateStr, timeStr);
+  if (!remindAt) {
+    await interaction.reply({
+      content: "❌ Invalid date or time. Use `YYYY-MM-DD` for date and `HH:MM` for time.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (remindAt <= new Date()) {
+    await interaction.reply({
+      content: "❌ That time is in the past. Please pick a future date and time.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const [reminder] = await db
+    .insert(remindersTable)
+    .values({
+      title,
+      remindAt,
+      channelId: interaction.channelId,
+      userId: interaction.user.id,
+    })
+    .returning();
+
+  await interaction.reply({
+    content: `✅ Reminder **#${reminder!.id}** set!\n📌 **${title}**\n🕐 ${formatRemindAt(remindAt)} (London time)`,
+  });
+}
+
+async function handleRemindList(interaction: ChatInputCommandInteraction): Promise<void> {
+  const reminders = await db
+    .select()
+    .from(remindersTable)
+    .where(eq(remindersTable.fired, false))
+    .orderBy(remindersTable.remindAt);
+
+  if (reminders.length === 0) {
+    await interaction.reply({ content: "📭 No upcoming reminders.", ephemeral: true });
+    return;
+  }
+
+  const lines = reminders.map(
+    (r) => `**#${r.id}** — ${r.title}\n   🕐 ${formatRemindAt(r.remindAt)} (London) · <@${r.userId}>`,
+  );
+
+  await interaction.reply({
+    content: `📋 **Upcoming Reminders**\n\n${lines.join("\n\n")}`,
+    ephemeral: true,
+  });
+}
+
+async function handleRemindRemove(interaction: ChatInputCommandInteraction): Promise<void> {
+  const id = interaction.options.getInteger("id", true);
+  const deleted = await db
+    .delete(remindersTable)
+    .where(and(eq(remindersTable.id, id), eq(remindersTable.fired, false)))
+    .returning();
+
+  if (deleted.length === 0) {
+    await interaction.reply({
+      content: `❌ No active reminder with ID **#${id}** found.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.reply({ content: `🗑️ Reminder **#${id}** removed.`, ephemeral: true });
+}
+
+// ── Message-based reminders ─────────────────────────────────────
+// Format: !remind add <title> | <YYYY-MM-DD> <HH:MM>
+//         !remind list
+//         !remind remove <id>
+
+async function handleReminderMessage(
+  message: Message,
+  reminderChannelId: string,
+): Promise<void> {
+  void reminderChannelId;
+  const content = message.content.trim();
+  if (!content.startsWith("!remind")) return;
+
+  const args = content.slice("!remind".length).trim();
+
+  if (args.startsWith("list")) {
+    const reminders = await db
+      .select()
+      .from(remindersTable)
+      .where(eq(remindersTable.fired, false))
+      .orderBy(remindersTable.remindAt);
+
+    if (reminders.length === 0) {
+      await message.reply("📭 No upcoming reminders.");
+      return;
+    }
+
+    const lines = reminders.map(
+      (r) => `**#${r.id}** — ${r.title}\n   🕐 ${formatRemindAt(r.remindAt)} (London) · <@${r.userId}>`,
+    );
+    await message.reply(`📋 **Upcoming Reminders**\n\n${lines.join("\n\n")}`);
+    return;
+  }
+
+  if (args.startsWith("remove")) {
+    const idStr = args.slice("remove".length).trim();
+    const id = parseInt(idStr, 10);
+    if (isNaN(id)) {
+      await message.reply("❌ Usage: `!remind remove <id>`");
+      return;
+    }
+    const deleted = await db
+      .delete(remindersTable)
+      .where(and(eq(remindersTable.id, id), eq(remindersTable.fired, false)))
+      .returning();
+
+    if (deleted.length === 0) {
+      await message.reply(`❌ No active reminder with ID **#${id}** found.`);
+    } else {
+      await message.reply(`🗑️ Reminder **#${id}** removed.`);
+    }
+    return;
+  }
+
+  if (args.startsWith("add")) {
+    // Format: add <title> | <YYYY-MM-DD> <HH:MM>
+    const rest = args.slice("add".length).trim();
+    const pipeIndex = rest.lastIndexOf("|");
+    if (pipeIndex === -1) {
+      await message.reply(
+        "❌ Usage: `!remind add <title> | <YYYY-MM-DD> <HH:MM>`\nExample: `!remind add Team standup | 2026-07-01 09:00`",
+      );
+      return;
+    }
+
+    const title = rest.slice(0, pipeIndex).trim();
+    const datetime = rest.slice(pipeIndex + 1).trim();
+    const [dateStr, timeStr] = datetime.split(" ");
+
+    if (!title || !dateStr || !timeStr) {
+      await message.reply(
+        "❌ Usage: `!remind add <title> | <YYYY-MM-DD> <HH:MM>`\nExample: `!remind add Team standup | 2026-07-01 09:00`",
+      );
+      return;
+    }
+
+    const remindAt = parseLondonLocal(dateStr, timeStr);
+    if (!remindAt) {
+      await message.reply("❌ Invalid date or time. Use `YYYY-MM-DD` and `HH:MM`.");
+      return;
+    }
+
+    if (remindAt <= new Date()) {
+      await message.reply("❌ That time is in the past. Please pick a future time.");
+      return;
+    }
+
+    const [reminder] = await db
+      .insert(remindersTable)
+      .values({
+        title,
+        remindAt,
+        channelId: message.channelId,
+        userId: message.author.id,
+      })
+      .returning();
+
+    await message.reply(
+      `✅ Reminder **#${reminder!.id}** set!\n📌 **${title}**\n🕐 ${formatRemindAt(remindAt)} (London time)`,
+    );
+    return;
+  }
+
+  await message.reply(
+    "ℹ️ **Reminder commands:**\n" +
+      "`!remind add <title> | <YYYY-MM-DD> <HH:MM>` — Add reminder\n" +
+      "`!remind list` — List upcoming reminders\n" +
+      "`!remind remove <id>` — Remove a reminder",
+  );
+}
+
+// ── Reminder fire loop ──────────────────────────────────────────
+
+async function fireReminders(client: Client, reminderChannelId: string): Promise<void> {
+  try {
+    const due = await db
+      .select()
+      .from(remindersTable)
+      .where(and(eq(remindersTable.fired, false), lt(remindersTable.remindAt, new Date())));
+
+    for (const reminder of due) {
+      try {
+        const channel = await client.channels.fetch(reminderChannelId);
+        if (channel instanceof TextChannel) {
+          await channel.send(
+            `🔔 **Reminder!** <@${reminder.userId}>\n📌 **${reminder.title}**\n🕐 Scheduled for ${formatRemindAt(reminder.remindAt)} (London time)`,
+          );
+        }
+
+        await db
+          .update(remindersTable)
+          .set({ fired: true })
+          .where(eq(remindersTable.id, reminder.id));
+
+        logger.info({ reminderId: reminder.id, title: reminder.title }, "Reminder fired");
+      } catch (err) {
+        logger.error({ err, reminderId: reminder.id }, "Failed to fire reminder");
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "Failed to check reminders");
+  }
+}
+
+// ── Main bot entry ──────────────────────────────────────────────
 
 export async function startDiscordBot(): Promise<void> {
   const token = process.env["DISCORD_BOT_TOKEN"];
   const channelId = process.env["DISCORD_CHANNEL_ID"];
+  const reminderChannelId = process.env["DISCORD_REMINDER_CHANNEL_ID"];
 
   if (!token) {
     logger.warn("DISCORD_BOT_TOKEN not set — Discord bot will not start");
@@ -89,27 +446,26 @@ export async function startDiscordBot(): Promise<void> {
     return;
   }
 
+  if (!reminderChannelId) {
+    logger.warn("DISCORD_REMINDER_CHANNEL_ID not set — reminders will not fire");
+  }
+
   const client = new Client({
-    intents: [GatewayIntentBits.Guilds],
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ],
   });
 
   async function updateChannelName(): Promise<void> {
     try {
       const channel = await client.channels.fetch(channelId!);
-      if (!channel) {
-        logger.error({ channelId }, "Channel not found");
+      if (!channel || !("setName" in channel) || typeof channel.setName !== "function") {
+        logger.error({ channelId }, "Channel not found or does not support name changes");
         return;
       }
-
-      if (!("setName" in channel) || typeof channel.setName !== "function") {
-        logger.error({ channelId }, "Channel does not support name changes");
-        return;
-      }
-
-      const time = getLondonTimeShort();
-      const date = getLondonDateShort();
-      const newName = `🕐 London: ${time} (${date})`;
-
+      const newName = `🕐 London: ${getLondonTimeShort()} (${getLondonDateShort()})`;
       await (channel as { setName: (name: string) => Promise<unknown> }).setName(newName);
       logger.info({ channelId, newName }, "Channel name updated");
     } catch (err) {
@@ -128,15 +484,37 @@ export async function startDiscordBot(): Promise<void> {
 
     await updateChannelName();
     setInterval(updateChannelName, UPDATE_INTERVAL_MS);
+
+    if (reminderChannelId) {
+      await fireReminders(client, reminderChannelId);
+      setInterval(() => fireReminders(client, reminderChannelId), REMINDER_CHECK_INTERVAL_MS);
+    }
   });
 
   client.on("interactionCreate", async (interaction: Interaction) => {
     if (!interaction.isChatInputCommand()) return;
+
     if (interaction.commandName === "status") {
-      await handleStatusCommand(interaction).catch((err) => {
-        logger.error({ err }, "Failed to handle /status command");
-      });
+      await handleStatusCommand(interaction).catch((err) =>
+        logger.error({ err }, "Failed to handle /status"),
+      );
+      return;
     }
+
+    if (interaction.commandName === "remind") {
+      const sub = interaction.options.getSubcommand();
+      if (sub === "add") await handleRemindAdd(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind add"));
+      if (sub === "list") await handleRemindList(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind list"));
+      if (sub === "remove") await handleRemindRemove(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind remove"));
+    }
+  });
+
+  client.on("messageCreate", async (message: Message) => {
+    if (message.author.bot) return;
+    if (!message.content.startsWith("!remind")) return;
+    await handleReminderMessage(message, reminderChannelId ?? "").catch((err) =>
+      logger.error({ err }, "Failed to handle reminder message"),
+    );
   });
 
   client.on("error", (err) => {
