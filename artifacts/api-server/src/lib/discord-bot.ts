@@ -327,6 +327,26 @@ const remindCommand = new SlashCommandBuilder()
       .addIntegerOption((opt) =>
         opt.setName("id").setDescription("Reminder ID from /remind list").setRequired(true),
       ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("edit")
+      .setDescription("Edit an existing reminder's title, date, time, or timezone")
+      .addIntegerOption((opt) =>
+        opt.setName("id").setDescription("Reminder ID from /remind list").setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt.setName("title").setDescription("New title (leave blank to keep current)").setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt.setName("date").setDescription("New date in YYYY-MM-DD format (leave blank to keep current)").setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt.setName("time").setDescription("New time in HH:MM format (leave blank to keep current)").setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt.setName("timezone").setDescription('Timezone for the new date/time, e.g. "Tokyo" (default: London)').setRequired(false),
+      ),
   );
 
 async function registerSlashCommands(token: string, clientId: string): Promise<void> {
@@ -456,6 +476,111 @@ async function handleRemindList(interaction: ChatInputCommandInteraction): Promi
 
   await interaction.reply({
     content: `📋 **Upcoming Reminders**\n\n${lines.join("\n\n")}`,
+    ephemeral: true,
+  });
+}
+
+async function handleRemindEdit(interaction: ChatInputCommandInteraction): Promise<void> {
+  const id = interaction.options.getInteger("id", true);
+  const newTitle = interaction.options.getString("title", false);
+  const newDate = interaction.options.getString("date", false);
+  const newTime = interaction.options.getString("time", false);
+  const tzInput = interaction.options.getString("timezone", false);
+
+  // Must supply at least one field to change
+  if (!newTitle && !newDate && !newTime) {
+    await interaction.reply({
+      content: "❌ Provide at least one of `title`, `date`, or `time` to update.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Load the existing reminder
+  const [existing] = await db
+    .select()
+    .from(remindersTable)
+    .where(and(eq(remindersTable.id, id), eq(remindersTable.fired, false)));
+
+  if (!existing) {
+    await interaction.reply({
+      content: `❌ No active reminder with ID **#${id}** found.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Resolve timezone if provided (used only when date/time is being changed)
+  let tz = LONDON_TIMEZONE;
+  let tzLabel = "London";
+  if (tzInput) {
+    const resolved = resolveTimezone(tzInput);
+    if (!resolved) {
+      await interaction.reply({
+        content:
+          `❌ Unknown timezone: \`${tzInput}\`\n` +
+          `Try a city name like \`Tokyo\`, \`Dubai\`, \`New York\` or an IANA zone like \`America/Chicago\`.`,
+        ephemeral: true,
+      });
+      return;
+    }
+    tz = resolved;
+    tzLabel = tzInput;
+  }
+
+  // Build the updated remindAt if date or time changed
+  let remindAt = existing.remindAt;
+  if (newDate || newTime) {
+    // Use existing date/time as fallback when only one is changed
+    const existingInTz = existing.remindAt.toLocaleString("en-GB", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    // en-GB format: DD/MM/YYYY, HH:MM
+    const [datePart, timePart] = existingInTz.split(", ");
+    const [dd, mm, yyyy] = (datePart ?? "").split("/");
+    const fallbackDate = `${yyyy}-${mm}-${dd}`;
+    const fallbackTime = (timePart ?? "00:00").slice(0, 5);
+
+    const dateStr = newDate ?? fallbackDate;
+    const timeStr = newTime ?? fallbackTime;
+
+    const parsed = parseLocalDatetime(dateStr!, timeStr!, tz);
+    if (!parsed) {
+      await interaction.reply({
+        content: "❌ Invalid date or time. Use `YYYY-MM-DD` for date and `HH:MM` for time.",
+        ephemeral: true,
+      });
+      return;
+    }
+    if (parsed <= new Date()) {
+      await interaction.reply({
+        content: "❌ The new time is in the past. Please pick a future date and time.",
+        ephemeral: true,
+      });
+      return;
+    }
+    remindAt = parsed;
+  }
+
+  const updatedTitle = newTitle ?? existing.title;
+
+  await db
+    .update(remindersTable)
+    .set({ title: updatedTitle, remindAt })
+    .where(eq(remindersTable.id, id));
+
+  const changes: string[] = [];
+  if (newTitle) changes.push(`📝 Title → **${updatedTitle}**`);
+  if (newDate || newTime) changes.push(`🕐 Time → ${formatRemindAt(remindAt)} (London) _(${tzLabel})_`);
+
+  await interaction.reply({
+    content: `✏️ Reminder **#${id}** updated!\n\n${changes.join("\n")}`,
     ephemeral: true,
   });
 }
@@ -779,6 +904,7 @@ export async function startDiscordBot(): Promise<void> {
       if (sub === "add") await handleRemindAdd(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind add"));
       if (sub === "list") await handleRemindList(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind list"));
       if (sub === "remove") await handleRemindRemove(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind remove"));
+      if (sub === "edit") await handleRemindEdit(interaction).catch((err) => logger.error({ err }, "Failed to handle /remind edit"));
     }
   });
 
