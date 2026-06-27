@@ -231,6 +231,30 @@ function parseLondonLocal(dateStr: string, timeStr: string): Date | null {
   return new Date(naiveUtc.getTime() + offsetMs);
 }
 
+/** Generic parser: treat input as local time in any IANA timezone, convert to UTC */
+function parseLocalDatetime(dateStr: string, timeStr: string, tz: string): Date | null {
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const timePattern = /^\d{2}:\d{2}$/;
+  if (!datePattern.test(dateStr) || !timePattern.test(timeStr)) return null;
+
+  const naiveUtc = new Date(`${dateStr}T${timeStr}:00Z`);
+  if (isNaN(naiveUtc.getTime())) return null;
+
+  const tzTimeStr = naiveUtc.toLocaleString("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const tzDate = new Date(tzTimeStr);
+  const offsetMs = naiveUtc.getTime() - tzDate.getTime();
+  return new Date(naiveUtc.getTime() + offsetMs);
+}
+
 function formatRemindAt(date: Date): string {
   return date.toLocaleString("en-GB", {
     timeZone: LONDON_TIMEZONE,
@@ -270,7 +294,7 @@ const remindCommand = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub
       .setName("add")
-      .setDescription("Add a new reminder (times are London time)")
+      .setDescription("Add a new reminder")
       .addStringOption((opt) =>
         opt.setName("title").setDescription("What to remind you about").setRequired(true),
       )
@@ -283,8 +307,14 @@ const remindCommand = new SlashCommandBuilder()
       .addStringOption((opt) =>
         opt
           .setName("time")
-          .setDescription("Time in HH:MM format (London time), e.g. 14:30")
+          .setDescription("Time in HH:MM format, e.g. 14:30")
           .setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("timezone")
+          .setDescription('City or timezone for the time, e.g. "Tokyo", "Dubai" (default: London)')
+          .setRequired(false),
       ),
   )
   .addSubcommand((sub) =>
@@ -352,8 +382,27 @@ async function handleRemindAdd(interaction: ChatInputCommandInteraction): Promis
   const title = interaction.options.getString("title", true);
   const dateStr = interaction.options.getString("date", true);
   const timeStr = interaction.options.getString("time", true);
+  const tzInput = interaction.options.getString("timezone", false);
 
-  const remindAt = parseLondonLocal(dateStr, timeStr);
+  // Resolve timezone — default to London
+  let tz = LONDON_TIMEZONE;
+  let tzLabel = "London";
+  if (tzInput) {
+    const resolved = resolveTimezone(tzInput);
+    if (!resolved) {
+      await interaction.reply({
+        content:
+          `❌ Unknown timezone: \`${tzInput}\`\n` +
+          `Try a city name like \`Tokyo\`, \`Dubai\`, \`New York\` or an IANA zone like \`America/Chicago\`.`,
+        ephemeral: true,
+      });
+      return;
+    }
+    tz = resolved;
+    tzLabel = tzInput;
+  }
+
+  const remindAt = parseLocalDatetime(dateStr, timeStr, tz);
   if (!remindAt) {
     await interaction.reply({
       content: "❌ Invalid date or time. Use `YYYY-MM-DD` for date and `HH:MM` for time.",
@@ -381,7 +430,11 @@ async function handleRemindAdd(interaction: ChatInputCommandInteraction): Promis
     .returning();
 
   await interaction.reply({
-    content: `✅ Reminder **#${reminder!.id}** set!\n📌 **${title}**\n🕐 ${formatRemindAt(remindAt)} (London time)`,
+    content:
+      `✅ Reminder **#${reminder!.id}** set!\n` +
+      `📌 **${title}**\n` +
+      `🕐 ${dateStr} at ${timeStr} (${tzLabel})\n` +
+      `_Fires at ${formatRemindAt(remindAt)} London time_`,
   });
 }
 
