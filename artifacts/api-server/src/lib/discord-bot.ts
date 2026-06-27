@@ -1,4 +1,12 @@
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  Interaction,
+} from "discord.js";
 import { logger } from "./logger";
 
 const LONDON_TIMEZONE = "Europe/London";
@@ -10,6 +18,7 @@ function getLondonTime(): string {
     timeZone: LONDON_TIMEZONE,
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
     hour12: false,
   });
 }
@@ -18,9 +27,51 @@ function getLondonDate(): string {
   const now = new Date();
   return now.toLocaleDateString("en-GB", {
     timeZone: LONDON_TIMEZONE,
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function getLondonTimeShort(): string {
+  const now = new Date();
+  return now.toLocaleTimeString("en-GB", {
+    timeZone: LONDON_TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function getLondonDateShort(): string {
+  const now = new Date();
+  return now.toLocaleDateString("en-GB", {
+    timeZone: LONDON_TIMEZONE,
     weekday: "short",
     day: "numeric",
     month: "short",
+  });
+}
+
+const statusCommand = new SlashCommandBuilder()
+  .setName("status")
+  .setDescription("Get the current London time");
+
+async function registerSlashCommands(token: string, clientId: string): Promise<void> {
+  const rest = new REST().setToken(token);
+  await rest.put(Routes.applicationCommands(clientId), {
+    body: [statusCommand.toJSON()],
+  });
+  logger.info("Slash commands registered globally");
+}
+
+async function handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const time = getLondonTime();
+  const date = getLondonDate();
+  await interaction.reply({
+    content: `🕐 **London Time**\n**Time:** ${time}\n**Date:** ${date}`,
+    ephemeral: false,
   });
 }
 
@@ -55,8 +106,8 @@ export async function startDiscordBot(): Promise<void> {
         return;
       }
 
-      const time = getLondonTime();
-      const date = getLondonDate();
+      const time = getLondonTimeShort();
+      const date = getLondonDateShort();
       const newName = `🕐 London: ${time} (${date})`;
 
       await (channel as { setName: (name: string) => Promise<unknown> }).setName(newName);
@@ -68,8 +119,24 @@ export async function startDiscordBot(): Promise<void> {
 
   client.once("ready", async () => {
     logger.info({ tag: client.user?.tag }, "Discord bot logged in");
+
+    if (client.user) {
+      await registerSlashCommands(token, client.user.id).catch((err) => {
+        logger.error({ err }, "Failed to register slash commands");
+      });
+    }
+
     await updateChannelName();
     setInterval(updateChannelName, UPDATE_INTERVAL_MS);
+  });
+
+  client.on("interactionCreate", async (interaction: Interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName === "status") {
+      await handleStatusCommand(interaction).catch((err) => {
+        logger.error({ err }, "Failed to handle /status command");
+      });
+    }
   });
 
   client.on("error", (err) => {
