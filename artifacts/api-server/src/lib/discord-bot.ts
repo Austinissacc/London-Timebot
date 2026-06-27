@@ -15,7 +15,9 @@ import { remindersTable } from "@workspace/db";
 import { lt, eq, and } from "drizzle-orm";
 
 const LONDON_TIMEZONE = "Europe/London";
-const UPDATE_INTERVAL_MS = 60 * 1000;
+// Discord rate-limits channel renames to 2 per 10 minutes per channel.
+// We update every 10 minutes to stay safely within that limit.
+const UPDATE_INTERVAL_MS = 10 * 60 * 1000;
 const REMINDER_CHECK_INTERVAL_MS = 30 * 1000;
 
 // ── Time helpers ────────────────────────────────────────────────
