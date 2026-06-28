@@ -1,0 +1,19 @@
+#!/bin/sh
+# Auto-push to GitHub on every commit.
+# Requires GITHUB_PERSONAL_ACCESS_TOKEN to be set as a secret.
+
+if [ -z "$GITHUB_PERSONAL_ACCESS_TOKEN" ]; then
+  echo "[github-sync] ERROR: GITHUB_PERSONAL_ACCESS_TOKEN is not set." >&2
+  exit 1
+fi
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+REMOTE_URL="https://${GITHUB_PERSONAL_ACCESS_TOKEN}@github.com/Austinissacc/London-Timebot.git"
+
+echo "[github-sync] Pushing branch '${BRANCH}' to GitHub..."
+if git push "$REMOTE_URL" "HEAD:refs/heads/${BRANCH}" 2>&1 | sed "s/${GITHUB_PERSONAL_ACCESS_TOKEN}/****/g"; then
+  echo "[github-sync] Push succeeded."
+else
+  echo "[github-sync] ERROR: Push to GitHub failed." >&2
+  exit 1
+fi
