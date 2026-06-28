@@ -1,19 +1,30 @@
-#!/bin/sh
+#!/bin/bash
 # Auto-push to GitHub on every commit.
-# Requires GITHUB_PERSONAL_ACCESS_TOKEN to be set as a secret.
+# Requires GITHUB_PERSONAL_ACCESS_TOKEN secret.
+set -euo pipefail
 
-if [ -z "$GITHUB_PERSONAL_ACCESS_TOKEN" ]; then
+if [ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]; then
   echo "[github-sync] ERROR: GITHUB_PERSONAL_ACCESS_TOKEN is not set." >&2
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-REMOTE_URL="https://${GITHUB_PERSONAL_ACCESS_TOKEN}@github.com/Austinissacc/London-Timebot.git"
+REPO_URL="https://github.com/Austinissacc/London-Timebot.git"
 
 echo "[github-sync] Pushing branch '${BRANCH}' to GitHub..."
-if git push "$REMOTE_URL" "HEAD:refs/heads/${BRANCH}" 2>&1 | sed "s/${GITHUB_PERSONAL_ACCESS_TOKEN}/****/g"; then
-  echo "[github-sync] Push succeeded."
-else
+
+# Capture output so the PAT is never echoed; use credential helper so token
+# is not embedded in the URL (avoids process-listing exposure).
+PUSH_OUTPUT=$(
+  git -c "credential.helper=${SCRIPT_DIR}/github-credential-helper" \
+    push "${REPO_URL}" "HEAD:refs/heads/${BRANCH}" 2>&1
+) || {
+  # On failure, print output (token not in it since URL has no inline token)
+  printf "%s\n" "${PUSH_OUTPUT}" >&2
   echo "[github-sync] ERROR: Push to GitHub failed." >&2
   exit 1
-fi
+}
+
+printf "%s\n" "${PUSH_OUTPUT}"
+echo "[github-sync] Push succeeded."
